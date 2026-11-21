@@ -4,6 +4,8 @@
 
 > Give DeepSeek Harness an elevated PowerShell inside a Hyper-V guest, without fighting UAC.
 
+**实测环境**：宿主 Windows 11 + Hyper-V，guest Windows 11 专业工作站版；VMConnect 使用基本会话；guest 管理员为本地账号（PowerShell Direct 下 `elevated=true`，无需 `LocalAccountTokenFilterPolicy`）。
+
 ---
 
 ## 它解决什么问题
