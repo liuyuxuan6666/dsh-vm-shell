@@ -251,6 +251,24 @@ powershell -ExecutionPolicy Bypass -File .\test\Test-Agent.ps1 -Body '{"op":"inf
 
 ---
 
+## 实测结果
+
+宿主 Windows 11 + Hyper-V，guest Windows 11 专业工作站版（重装后干净系统），agent 以管理员运行：
+
+| 项目 | 结果 |
+|---|---|
+| `vm_ps`（PowerShell Direct） | ✅ `elevated=True`，首次调用 6 秒 |
+| 注入建账号（`vm_key`/`vm_type`） | ✅ 新系统上重建 `dsh` 管理员成功 |
+| UAC 同意框 | ✅ `Alt+Y` 注入点掉，之后能拿到提权终端 |
+| `power stop` | ✅ `state=3` |
+| `power start` | ✅ 3 秒内 `state=2` |
+| 关机后 `vm_ps` | ✅ guest 起来后自动恢复应答 |
+| 无签名请求 | ✅ `unsupported protocol version` |
+| 错签名 | ✅ `signature mismatch` |
+| nonce 重放 | ✅ `replayed nonce` |
+
+---
+
 ## 开发注意（踩过的坑）
 
 **PowerShell 函数名不要和内置 cmdlet 只差大小写或连字符位置。** 命令解析不区分大小写，`New-PsSession` 与 `New-PSSession` 是同一个名字：自定义函数会**覆盖** cmdlet，函数内部再调 `New-PSSession` 就是调自己，报错为

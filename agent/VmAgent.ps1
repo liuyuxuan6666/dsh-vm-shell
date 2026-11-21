@@ -219,11 +219,10 @@ function New-GuestSession {
   }
   $sec = ConvertTo-SecureString $cfg.guestPassword -AsPlainText -Force
   $cred = New-Object System.Management.Automation.PSCredential($cfg.guestUser, $sec)
-  # Without explicit timeouts a dead guest makes New-PSSession hang for minutes,
-  # and the whole single-threaded request loop with it.
-  $opts = New-PSSessionOption -OpenTimeout 15000 -OperationTimeout 60000 -CancelTimeout 5000
+  # NB: the -VMName parameter set does not accept -SessionOption, so timeouts
+  # cannot be set here. A guest that never answers is bounded at the client.
   Log "opening PowerShell Direct session to $($cfg.vm) as $($cfg.guestUser)"
-  $script:Session = New-PSSession -VMName $cfg.vm -Credential $cred -SessionOption $opts -ErrorAction Stop
+  $script:Session = New-PSSession -VMName $cfg.vm -Credential $cred -ErrorAction Stop
   return $script:Session
 }
 
@@ -307,7 +306,7 @@ function Invoke-GuestScript([string]$base64, [int]$timeoutSec, [int]$bootWaitSec
 function Invoke-Op($req) {
   $op = [string]$req.op
   switch ($op) {
-    'ping' { return @{ ok = $true; pong = $true; name = 'dsh-vm-shell'; version = '1.2.0' } }
+    'ping' { return @{ ok = $true; pong = $true; name = 'dsh-vm-shell'; version = '1.2.2' } }
 
     'info' {
       $vm = Get-VmInstance $cfg.vm
@@ -460,7 +459,7 @@ try {
 } catch { $hash = 'unknown' }
 $who = [Security.Principal.WindowsIdentity]::GetCurrent()
 $isAdmin = (New-Object Security.Principal.WindowsPrincipal($who)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-$banner = "agent v1.2.1 pid=$PID user=$($who.Name) admin=$isAdmin file=$PSCommandPath sha256=$hash"
+$banner = "agent v1.2.2 pid=$PID user=$($who.Name) admin=$isAdmin file=$PSCommandPath sha256=$hash"
 Log $banner
 if ($Trace) { Write-Host $banner }
 
