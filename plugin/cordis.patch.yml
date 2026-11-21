@@ -1,0 +1,14 @@
+# This bundle layer inserts the vm-shell tools process-wide, so every agent
+# preset gets `vm_ps` / `vm_status` / `vm_key` / `vm_type` / `vm_uac_yes` /
+# `vm_screenshot` without declaring anything in a preset.
+#
+# The entry name is PATH-RELATIVE on purpose: DSH anchors a relative `name:`
+# to the directory of the patch file that declared it, so this row always loads
+# this bundle's own index.js whatever the installed folder is called.
+#
+# The tools are clients for the localhost agent in `agent/`, which must be
+# installed separately (it needs Administrator/SYSTEM for Hyper-V WMI).
+
+- insert:
+    - id: dsh-vm-shell
+      name: './index.js'
