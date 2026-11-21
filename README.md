@@ -102,8 +102,9 @@ powershell -ExecutionPolicy Bypass -File .\agent\Install-VmAgent.ps1 `
 
 | 工具 | 作用 |
 |---|---|
-| `vm_ps` | **主力**。在 guest 里跑一段 PowerShell，提权，返回输出。 |
-| `vm_status` | agent 是否在线、控制的 VM、guest 账号、会话状态。 |
+| `vm_ps` | **主力**。在 guest 里跑一段 PowerShell，提权，返回输出。VM 关着会自动开机。 |
+| `vm_status` | agent 是否在线、控制的 VM、电源状态、guest 账号、会话状态。 |
+| `vm_power` | `state` / `start` / `stop` / `reset`。开关机。 |
 | `vm_uac_yes` | 用 `Alt+Y` 答应 guest 的 UAC 同意框。 |
 | `vm_key` | 注入单个虚拟键（`down`/`up` 可拼组合键）。 |
 | `vm_type` | 注入 ASCII 文本（引导用；无 IME）。 |
@@ -118,12 +119,73 @@ vm_ps: Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version
 
 ---
 
+## 开机自启与 VM 电源
+
+### agent 会自启
+
+`Install-VmAgent.ps1` 注册的是 **SYSTEM + `AtStartup`** 的计划任务：
+
+- 宿主开机即启动，**不需要登录桌面**、不弹 UAC、没有窗口
+- 只监听 `127.0.0.1`，不依赖网络和 Hyper-V 服务就绪（它启动时不做 Hyper-V 调用）
+- 失败会按计划任务设置重启 3 次（间隔 1 分钟）
+
+查状态：
+
+```powershell
+Get-ScheduledTask -TaskName DshVmShell | Select-Object TaskName, State
+```
+
+### VM 不一定自启：两处都配上最稳
+
+Hyper-V 自己的自动启动默认**取决于创建方式**，很多 VM 是"关机后不会自动开"。两条互补的路：
+
+**a) 让 Hyper-V 开机就拉起 VM**（推荐，省一次往返）：
+
+```powershell
+Set-VM -Name win11 -AutomaticStartAction Start -AutomaticStartDelay 0
+Set-VM -Name win11 -AutomaticStopAction ShutDown
+```
+
+**b) 让 agent 按需开机**（默认已开启，`autoStart: true`）：
+
+`vm_ps` 在发脚本前会检查 `EnabledState`；不是 Running 就 `RequestStateChange(2)`，然后每 3 秒轮询，直到 guest 能应答 PowerShell Direct（默认最多 180 秒，`bootWaitSec` 可调）。也可以显式调用：
+
+```
+vm_power action=start
+```
+
+冷启动的正常时间线：`RequestStateChange` → 3–10 秒进入 Running → 再等 20–60 秒 guest 才响应 PS Direct（这个阶段 `ps` 会自动重试，不会报错）。
+
+### 宿主重启之后
+
+| 时刻 | 状态 |
+|---|---|
+| T+0 | 宿主重启 |
+| T+5s | `DshVmShell` 任务启动，17801 开始监听 |
+| T+10s | VM 被 Hyper-V 或 agent 拉起（看上面 a/b） |
+| T+30~60s | guest 起来，`vm_ps` 恢复正常 |
+
+唯一需要人做的事：等你登录 DSH 并发一句话。
+
+---
+
 ## 安全模型
 
-- agent 只监听 `127.0.0.1`，每个请求都要 token。
-- token 文件对 Users 可读 —— 也就是说，**你这台机器上任何以你身份运行的进程都能控制那台 VM**。这是"免提权"的代价，接受不了就改成只允许 Administrators 读，并让 DSH 也提权运行。
+- agent 只监听 `127.0.0.1`，**不监听任何网卡**，局域网里的其他设备连不上。
+- 每个请求都用 **HMAC-SHA256** 签名，带时间戳和一次性 nonce：
+  - 签名错误 → 拒绝
+  - 时间戳偏离超过 300 秒 → 拒绝
+  - 同一 nonce 重复出现 → 拒绝（防重放）
+  - 比较用常量时间，避免逐字节爆破
+- 密钥 32 字节随机，只在 `%ProgramData%\DshVmShell\secret.txt`，ACL 只给**运行 DSH 的账号** + SYSTEM + Administrators，不再给 Users 组。
 - guest 密码明文存在 `config.json`（ACL 仅 SYSTEM + Administrators）。它只是 VM 里的一个本地账号。
 - 建议给这个账号配上 VM 内最小够用的权限，别复用你真实机器的密码。
+
+### 威胁模型说清楚
+
+密钥对你的账号可读，所以**任何以你身份运行的进程**都能签名并控制那台 VM。这是"插件不需要提权"的代价：插件跑在你的用户会话里，它必须能读到密钥才能签名。
+
+真正的边界是**账号边界**（别的 Windows 账号读不到密钥），而不是"本机所有进程"。要更严格，可以让 DSH 也以管理员运行，再把密钥 ACL 收窄到 Administrators。
 
 ---
 
@@ -137,6 +199,7 @@ vm_ps: Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version
 | 缩略图颜色发紫发绿 | 实际是 **BGR565**，按 RGB565 解就错 | 已内置 `bgr565` 默认 |
 | `GetVirtualSystemThumbnailImage` 报参数不存在 | 参数按字母序（`HeightPixels, TargetSystem, WidthPixels`） | agent 按名字绑定，不按位置 |
 | 计划任务起来了但端口没监听 | 手动的 agent 还占着 17801 | 先结束手动那个进程 |
+| **脚本被安全软件直接删掉 / 计划任务消失** | agent 同时具备"隐藏窗口 + SYSTEM + 本地套接字 + 远程执行 PowerShell"这些特征，被杀软按后门启发式命中（实测火绒会隔离 `VmAgent.ps1` 并移除任务） | 把 `%ProgramData%\DshVmShell` 和项目目录加进杀软信任区，再重跑安装器。见下方 |
 | `Invoke-Command -VMName` 权限报错 | 调用方不是管理员 | agent 必须以 SYSTEM/Administrator 运行 |
 
 ---
@@ -158,12 +221,18 @@ plugin/
 
 ## 协议
 
-一行一个 JSON，回一行 JSON。除 `ping` 外都要带 `"t": "<token>"`。
+一行一个 JSON 信封，回一行 JSON。**每个请求都要签名**，`ping` 也不例外。
 
 ```jsonc
+// 信封
+{"v":1,"ts":1763700000,"nonce":"<32 hex>","b":"<base64(body)>","sig":"<hex>"}
+// sig = HMAC_SHA256(key, "<ts>.<nonce>.<b>")
+
+// body 里的 op
 {"op":"ping"}
 {"op":"info"}
 {"op":"ps","script":"<base64 utf8>","timeout":120}
+{"op":"power","action":"start"}
 {"op":"key","vk":13}
 {"op":"keydown","vk":18} / {"op":"keyup","vk":18}
 {"op":"text","text":"notepad"}
@@ -172,17 +241,31 @@ plugin/
 {"op":"vms"}
 ```
 
-手测：
+手测（自带签名逻辑）：
 
 ```powershell
-$t = Get-Content "$env:ProgramData\DshVmShell\token.txt" -Raw
-$c = New-Object Net.Sockets.TcpClient
-$c.Connect('127.0.0.1', 17801)
-$w = New-Object IO.StreamWriter($c.GetStream()); $w.AutoFlush = $true
-$r = New-Object IO.StreamReader($c.GetStream())
-$w.WriteLine((@{ op = 'info'; t = $t } | ConvertTo-Json -Compress))
-$r.ReadLine()
+powershell -ExecutionPolicy Bypass -File .\test\Test-Agent.ps1 -Body '{"op":"info"}'
 ```
+
+未签名、签名错、时间戳过期、nonce 重放，都会得到 `{"ok":false,"error":"...","auth":false}`。
+
+---
+
+## 杀软误报
+
+这个 agent 天生"长得像后门"：隐藏窗口、SYSTEM 计划任务、本地套接字、在远端执行 PowerShell。启发式引擎命中它很正常，不代表真的有问题，但你必须**主动加白**，否则：
+
+- `agent.ps1` 会被直接隔离（文件消失）
+- `DshVmShell` 计划任务会被移除
+
+需要加白的两处：
+
+1. 目录 `%ProgramData%\DshVmShell\`
+2. 你放这个仓库的目录
+
+以火绒为例：`安全设置 → 信任区 → 添加目录`，然后重跑 `Install-VmAgent.ps1`。
+
+不想加白的话，就得每次开机手动起一次 agent（`powershell -File agent\VmAgent.ps1`），那样就失去"重启后自愈"的意义了。
 
 ---
 

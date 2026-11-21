@@ -13,43 +13,59 @@ import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import fs from 'node:fs'
+import crypto from 'node:crypto'
 
 export const name = 'dsh-vm-shell'
 export const inject = ['tools']
 
 const DEFAULT_PORT = 17801
-const DEFAULT_TOKEN_PATH = path.join(
+const DEFAULT_SECRET_PATH = path.join(
   process.env.ProgramData ?? 'C:\\ProgramData',
   'DshVmShell',
-  'token.txt',
+  'secret.txt',
 )
 
 function resolveConfig(settings = {}) {
   return {
     port: Number(settings.port) > 0 ? Number(settings.port) : DEFAULT_PORT,
-    tokenPath: typeof settings.tokenPath === 'string' && settings.tokenPath
-      ? settings.tokenPath
-      : DEFAULT_TOKEN_PATH,
+    // The HMAC key is normally read from the file the installer created. It can
+    // also be supplied inline (hex) for a profile that manages its own secret.
+    secretPath: typeof settings.secretPath === 'string' && settings.secretPath
+      ? settings.secretPath
+      : DEFAULT_SECRET_PATH,
+    secret: typeof settings.secret === 'string' ? settings.secret.trim() : '',
     timeoutMs: Number(settings.timeoutMs) > 0 ? Number(settings.timeoutMs) : 150000,
   }
 }
 
-function readToken(cfg) {
-  try {
-    const token = fs.readFileSync(cfg.tokenPath, 'utf8').trim()
-    if (token) return token
-  } catch {
-    // fall through to the hint below
+function readSecret(cfg) {
+  const hex = cfg.secret || (() => {
+    try {
+      return fs.readFileSync(cfg.secretPath, 'utf8').trim()
+    } catch {
+      return ''
+    }
+  })()
+  if (!hex) {
+    throw new Error(
+      `dsh-vm-shell: no signing secret at ${cfg.secretPath}. ` +
+      `Run agent/Install-VmAgent.ps1 in an elevated PowerShell first.`,
+    )
   }
-  throw new Error(
-    `dsh-vm-shell: no agent token at ${cfg.tokenPath}. ` +
-    `Run agent/Install-VmAgent.ps1 in an elevated PowerShell first.`,
-  )
+  if (!/^[0-9a-fA-F]+$/.test(hex) || hex.length % 2 !== 0) {
+    throw new Error(`dsh-vm-shell: signing secret at ${cfg.secretPath} is not valid hex`)
+  }
+  return Buffer.from(hex, 'hex')
 }
 
-/** One request/response line against the agent. */
-function request(cfg, payload) {
-  const line = JSON.stringify(payload)
+/** One signed request/response line against the agent. */
+function request(cfg, body) {
+  const key = readSecret(cfg)
+  const ts = Math.floor(Date.now() / 1000)
+  const nonce = crypto.randomBytes(16).toString('hex')
+  const b = Buffer.from(JSON.stringify(body), 'utf8').toString('base64')
+  const sig = crypto.createHmac('sha256', key).update(`${ts}.${nonce}.${b}`).digest('hex')
+  const line = JSON.stringify({ v: 1, ts, nonce, b, sig })
   return new Promise((resolve, reject) => {
     const socket = net.createConnection({ host: '127.0.0.1', port: cfg.port })
     let buffer = ''
@@ -103,10 +119,7 @@ const textBlock = (text) => [{ type: 'text', text }]
 
 export function apply(ctx, settings = {}) {
   const cfg = resolveConfig(settings)
-  const call = (payload) => {
-    const token = readToken(cfg)
-    return request(cfg, { ...payload, t: token })
-  }
+  const call = (payload) => request(cfg, payload)
 
   // ---------------------------------------------------------------- vm_ps
   ctx.tools.register({
@@ -126,6 +139,12 @@ export function apply(ctx, settings = {}) {
         timeoutSec: {
           type: 'number',
           description: 'How long the guest may take, in seconds. Default 120.',
+        },
+        bootWaitSec: {
+          type: 'number',
+          description:
+            'If the VM is off, start it and wait up to this many seconds for the guest to answer. ' +
+            'Default 180, which covers a cold boot.',
         },
       },
       required: ['script'],
@@ -158,7 +177,12 @@ export function apply(ctx, settings = {}) {
         throw new Error('vm_ps: script must be a non-empty string')
       }
       const b64 = Buffer.from(args.script, 'utf8').toString('base64')
-      const reply = expectOk(await call({ op: 'ps', script: b64, timeout: args.timeoutSec ?? 120 }))
+      const reply = expectOk(await call({
+        op: 'ps',
+        script: b64,
+        timeout: args.timeoutSec ?? 120,
+        bootWaitSec: args.bootWaitSec ?? 180,
+      }))
       return {
         output: reply.output ?? '',
         errors: reply.errors ?? '',
@@ -185,13 +209,16 @@ export function apply(ctx, settings = {}) {
           agent: { type: 'string' },
           vm: { type: 'string' },
           state: { type: 'number' },
+          running: { type: 'boolean' },
+          autoStart: { type: 'boolean' },
           guest: { type: 'string' },
           session: { type: 'string' },
         },
         required: ['agent'],
       },
       render: (_args, value) => textBlock(
-        `agent=${value.agent} vm=${value.vm} state=${value.state} guest=${value.guest} session=${value.session}`,
+        `agent=${value.agent} vm=${value.vm} state=${value.state} running=${value.running} ` +
+        `autoStart=${value.autoStart} guest=${value.guest} session=${value.session}`,
       ),
     },
     async execute() {
@@ -200,8 +227,52 @@ export function apply(ctx, settings = {}) {
         agent: 'up',
         vm: reply.vm ?? '',
         state: typeof reply.state === 'number' ? reply.state : 0,
+        running: reply.running === true,
+        autoStart: reply.autoStart === true,
         guest: reply.guest ?? '',
         session: reply.session ?? 'none',
+      }
+    },
+  })
+
+  // ------------------------------------------------------------- vm_power
+  ctx.tools.register({
+    name: 'vm_power',
+    description:
+      'Read or change the Hyper-V power state: state, start, stop, reset. ' +
+      'start waits for the guest to reach Running and is the tool to use when the VM did not ' +
+      'come up after a host reboot; vm_ps also starts it on demand.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['state', 'start', 'stop', 'reset'],
+          description: 'Default state.',
+        },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          action: { type: 'string' },
+          state: { type: 'number' },
+          running: { type: 'boolean' },
+        },
+        required: ['action'],
+      },
+      render: (_args, value) => textBlock(`${value.action}: state=${value.state} running=${value.running}`),
+    },
+    async execute(args) {
+      const action = ['state', 'start', 'stop', 'reset'].includes(args.action) ? args.action : 'state'
+      const reply = await call({ op: 'power', action })
+      if (reply?.ok !== true) throw new Error(`vm_power: ${reply?.error ?? 'agent error'}`)
+      return {
+        action,
+        state: typeof reply.state === 'number' ? reply.state : 0,
+        running: reply.running === true || reply.started === true,
       }
     },
   })

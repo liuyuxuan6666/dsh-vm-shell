@@ -20,7 +20,8 @@ param(
   [Parameter(Mandatory = $true)][string]$GuestUser,
   [Parameter(Mandatory = $true)][string]$GuestPassword,
   [int]$Port = 17801,
-  [string]$TaskName = 'DshVmShell'
+  [string]$TaskName = 'DshVmShell',
+  [switch]$NoAutoStart
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,13 +48,22 @@ if (-not $vm) {
 $dir = Join-Path $env:ProgramData 'DshVmShell'
 if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
 
-$token = -join ((48..57) + (97..122) | Get-Random -Count 40 | ForEach-Object { [char]$_ })
+$secretPath = Join-Path $dir 'secret.txt'
+$secretBytes = New-Object byte[] 32
+$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+$rng.GetBytes($secretBytes)
+$rng.Dispose()
+$secret = [BitConverter]::ToString($secretBytes).Replace('-', '').ToLowerInvariant()
+Set-Content -Path $secretPath -Value $secret -Encoding ASCII -NoNewline
+
 $cfg = [ordered]@{
   vm            = $VmName
   guestUser     = $GuestUser
   guestPassword = $GuestPassword
   port          = $Port
-  token         = $token
+  secretPath    = $secretPath
+  # When the VM is found off, start it and wait for the guest to answer.
+  autoStart     = -not $NoAutoStart
 }
 $cfgPath = Join-Path $dir 'config.json'
 ($cfg | ConvertTo-Json) | Set-Content -Path $cfgPath -Encoding UTF8 -NoNewline
@@ -61,17 +71,26 @@ $cfgPath = Join-Path $dir 'config.json'
 # Lock the credential down: SYSTEM + Administrators only.
 & icacls.exe $cfgPath /inheritance:r /grant:r 'SYSTEM:(F)' 'Administrators:(F)' | Out-Null
 
-# The token is what a normal user process needs, so it stays readable.
-$tokenPath = Join-Path $dir 'token.txt'
-Set-Content -Path $tokenPath -Value $token -Encoding ASCII -NoNewline
-& icacls.exe $tokenPath /inheritance:r /grant:r 'SYSTEM:(F)' 'Administrators:(F)' 'Users:(R)' | Out-Null
+# The signing key is only readable by the account that runs DSH (the plugin
+# signs its requests with it), plus SYSTEM and Administrators.
+$callerSid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+& icacls.exe $secretPath /inheritance:r /grant:r 'SYSTEM:(F)' 'Administrators:(F)' "*$($callerSid):(R)" | Out-Null
+
+# Retire the plaintext token from earlier versions, if present.
+$legacyToken = Join-Path $dir 'token.txt'
+if (Test-Path $legacyToken) { Remove-Item -Path $legacyToken -Force }
+
+# Copy the agent next to its config so the installed task does not depend on a
+# source checkout staying where it is.
+$installedAgent = Join-Path $dir 'agent.ps1'
+Copy-Item -Path $agent -Destination $installedAgent -Force
 
 # --- register the task -----------------------------------------------------
 $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($existing) { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false }
 
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-  -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$agent`""
+  -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installedAgent`""
 $trigger = New-ScheduledTaskTrigger -AtStartup
 $runAs = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
@@ -88,12 +107,11 @@ $state = (Get-ScheduledTask -TaskName $TaskName).State
 Write-Host ''
 Write-Host "VM             : $VmName"
 Write-Host "Guest account  : $GuestUser"
-Write-Host "Agent          : $agent"
+Write-Host "Agent          : $installedAgent"
 Write-Host "Config         : $cfgPath  (password, admin-only)"
-Write-Host "Token          : $tokenPath"
+Write-Host "Signing secret : $secretPath  (HMAC-SHA256 key, readable only by $env:USERNAME)"
 Write-Host "Task '$TaskName': $state"
 Write-Host "Listening      : 127.0.0.1:$Port"
 Write-Host ''
-Write-Host 'Next: install the DSH plugin, or try a request by hand:'
-Write-Host "  `$t = Get-Content '$tokenPath' -Raw"
-Write-Host "  See README.md for the request format."
+Write-Host 'Next: install the DSH plugin (it reads the signing secret itself), or test by hand.'
+Write-Host "  Test helper: test/Test-Agent.ps1 -SecretPath '$secretPath'"

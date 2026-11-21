@@ -19,10 +19,16 @@
   * Guest running Windows 10/11 or Server 2016+ with a local admin account
   * Guest console in BASIC session (enhanced session breaks injection)
 
-  Protocol
-  --------
-  127.0.0.1:<port>, one JSON object per line, one JSON reply per line.
-  Every request except "ping" must carry "t": "<token>".
+  Authentication
+  --------------
+  Every request is HMAC-SHA256 signed with a 32-byte key from secret.txt:
+
+    {"v":1,"ts":<unix seconds>,"nonce":"<hex>","b":"<base64 body>","sig":"<hex>"}
+    sig = HMAC_SHA256(key, "<ts>.<nonce>.<b>")
+
+  The agent rejects a bad signature, a timestamp outside a 300 s window, and a
+  nonce it has already accepted. The key file is readable only by the account
+  that runs DSH (plus SYSTEM and Administrators).
 
   Start it through Install-VmAgent.ps1; running it by hand is supported too:
     powershell -ExecutionPolicy Bypass -File VmAgent.ps1
@@ -31,7 +37,7 @@ param(
   [string]$ConfigPath = (Join-Path $env:ProgramData 'DshVmShell\config.json'),
   [string]$VmName = '',
   [int]$Port = 0,
-  [switch]$Verbose
+  [switch]$Trace
 )
 
 $ErrorActionPreference = 'Stop'
@@ -43,7 +49,7 @@ $LogFile = Join-Path $StateDir 'agent.log'
 function Log([string]$m) {
   $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $m"
   try { Add-Content -Path $LogFile -Value $line -Encoding UTF8 } catch { }
-  if ($Verbose) { Write-Host $line }
+  if ($Trace) { Write-Host $line }
 }
 
 # ----------------------------------------------------------------- config
@@ -54,7 +60,73 @@ $cfg = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
 if ($VmName) { $cfg.vm = $VmName }
 if ($Port) { $cfg.port = $Port }
 if (-not $cfg.port) { $cfg.port = 17801 }
-if (-not $cfg.token) { throw "config has no token" }
+
+# ----------------------------------------------------------------- authentication
+$SecretPath = if ($cfg.secretPath) { [string]$cfg.secretPath } else { Join-Path $StateDir 'secret.txt' }
+$MaxSkewSeconds = 300
+$MaxRequestBytes = 8MB
+
+function Get-HmacKey([string]$path) {
+  if (-not (Test-Path $path)) { throw "no signing secret at $path (run Install-VmAgent.ps1)" }
+  $hex = (Get-Content -Path $path -Raw).Trim()
+  if ($hex.Length -lt 32 -or ($hex.Length % 2) -ne 0) { throw "secret at $path is not valid hex" }
+  $bytes = New-Object byte[] ($hex.Length / 2)
+  for ($i = 0; $i -lt $bytes.Length; $i++) {
+    $bytes[$i] = [Convert]::ToByte($hex.Substring($i * 2, 2), 16)
+  }
+  return , $bytes
+}
+
+# Constant-time comparison: a timing difference would let a caller guess a
+# signature byte by byte.
+function Test-Signature([string]$payload, [string]$sig, [byte[]]$key) {
+  if (-not $sig) { return $false }
+  $h = New-Object System.Security.Cryptography.HMACSHA256
+  try {
+    $h.Key = $key
+    $computed = [BitConverter]::ToString($h.ComputeHash([Text.Encoding]::UTF8.GetBytes($payload))).Replace('-', '').ToLowerInvariant()
+  } finally { $h.Dispose() }
+  if ($computed.Length -ne $sig.Length) { return $false }
+  $diff = 0
+  for ($i = 0; $i -lt $computed.Length; $i++) {
+    $diff = $diff -bor ([int][char]$computed[$i] -bxor [int][char]$sig[$i])
+  }
+  return ($diff -eq 0)
+}
+
+$script:NonceSeen = @{}
+
+function Test-Envelope($line, [byte[]]$key) {
+  if ($line.Length -gt $MaxRequestBytes) { throw "request too large" }
+  $env = $line | ConvertFrom-Json
+  if ($null -eq $env -or [int]$env.v -ne 1) { throw "unsupported protocol version" }
+
+  $ts = 0L
+  if (-not [long]::TryParse([string]$env.ts, [ref]$ts)) { throw "bad timestamp" }
+  $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+  if ([Math]::Abs($now - $ts) -gt $MaxSkewSeconds) { throw "timestamp outside the allowed window" }
+
+  $nonce = [string]$env.nonce
+  if (-not $nonce -or $nonce.Length -lt 16 -or $nonce.Length -gt 64) { throw "bad nonce" }
+  if ($script:NonceSeen.ContainsKey($nonce)) { throw "replayed nonce" }
+
+  $b64 = [string]$env.b
+  if (-not $b64) { throw "empty body" }
+  if (-not (Test-Signature "$ts.$nonce.$b64" ([string]$env.sig) $key)) { throw "signature mismatch" }
+
+  # Remember the nonce only after the signature proved the caller holds the key,
+  # otherwise anyone could poison the cache.
+  $script:NonceSeen[$nonce] = $now
+  if ($script:NonceSeen.Count -gt 4096) {
+    $cutoff = $now - ($MaxSkewSeconds * 2)
+    foreach ($k in @($script:NonceSeen.Keys)) {
+      if ($script:NonceSeen[$k] -lt $cutoff) { $script:NonceSeen.Remove($k) }
+    }
+  }
+
+  $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
+  return ($json | ConvertFrom-Json)
+}
 
 # ----------------------------------------------------------------- Hyper-V
 function Get-VmInstance([string]$name) {
@@ -141,8 +213,7 @@ function Get-ScreenPng([int]$w, [int]$h, [string]$fmt) {
 # ----------------------------------------------------------------- PowerShell Direct
 $script:Session = $null
 
-function Get-PsSession {
-  if ($script:Session -and $script:Session.State -eq 'Opened') { return $script:Session }
+function New-PsSession {
   if (-not $cfg.guestUser -or -not $cfg.guestPassword) {
     throw "no guestUser/guestPassword in config; write them or run Install-VmAgent.ps1"
   }
@@ -153,15 +224,49 @@ function Get-PsSession {
   return $script:Session
 }
 
+# Open (or reuse) the session. With waitSec > 0 it keeps retrying: right after a
+# boot the guest is Running long before PowerShell Direct answers.
+function Get-PsSession([int]$waitSec = 0) {
+  $deadline = (Get-Date).AddSeconds([Math]::Max($waitSec, 0))
+  while ($true) {
+    if ($script:Session -and $script:Session.State -eq 'Opened') { return $script:Session }
+    try {
+      return (New-PsSession)
+    } catch {
+      if ((Get-Date) -ge $deadline) { throw }
+      Start-Sleep -Seconds 3
+    }
+  }
+}
+
 function Reset-PsSession {
   if ($script:Session) { try { Remove-PSSession $script:Session -ErrorAction SilentlyContinue } catch { } }
   $script:Session = $null
 }
 
+# Make sure the VM is running, starting it when configured to.
+function Ensure-VmRunning([int]$waitSec = 0) {
+  $vm = Get-VmInstance $cfg.vm
+  if (-not $vm) { throw "VM '$($cfg.vm)' not found" }
+  if ($vm.EnabledState -eq 2) { return $true }
+  if ($cfg.autoStart -eq $false) {
+    throw "VM '$($cfg.vm)' is not running (EnabledState=$($vm.EnabledState)) and autoStart is false"
+  }
+  Log "starting VM '$($cfg.vm)' (EnabledState=$($vm.EnabledState))"
+  [void](Invoke-MethodPositional $vm 'RequestStateChange' @([uint16]2))
+  $deadline = (Get-Date).AddSeconds([Math]::Max($waitSec, 5))
+  while ((Get-Date) -lt $deadline) {
+    Start-Sleep -Seconds 3
+    $vm = Get-VmInstance $cfg.vm
+    if ($vm -and $vm.EnabledState -eq 2) { return $true }
+  }
+  return $false
+}
+
 # Run one PowerShell script inside the guest, elevated, and return its text output.
-function Invoke-GuestScript([string]$base64, [int]$timeoutSec) {
+function Invoke-GuestScript([string]$base64, [int]$timeoutSec, [int]$bootWaitSec = 0) {
   if ($timeoutSec -le 0) { $timeoutSec = 120 }
-  $s = Get-PsSession
+  $s = Get-PsSession -waitSec $bootWaitSec
   $sb = {
     param($b64)
     $ErrorActionPreference = 'Continue'
@@ -181,34 +286,35 @@ function Invoke-GuestScript([string]$base64, [int]$timeoutSec) {
       $elevated = $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     } catch { }
     return [pscustomobject]@{
-      Output   = $out
-      Errors   = $err
-      HostName = $env:COMPUTERNAME
-      User     = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-      Elevated = $elevated
+      Output    = $out
+      Errors    = $err
+      HostName  = $env:COMPUTERNAME
+      User      = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+      Elevated  = $elevated
       PSVersion = $PSVersionTable.PSVersion.ToString()
     }
   }
-  $r = Invoke-Command -Session $s -ScriptBlock $sb -ArgumentList $base64 -ErrorAction Stop
-  return $r
+  return (Invoke-Command -Session $s -ScriptBlock $sb -ArgumentList $base64 -ErrorAction Stop)
 }
 
 # ----------------------------------------------------------------- ops
 function Invoke-Op($req) {
   $op = [string]$req.op
   switch ($op) {
-    'ping' { return @{ ok = $true; pong = $true; name = 'dsh-vm-shell'; version = '1.0.0' } }
+    'ping' { return @{ ok = $true; pong = $true; name = 'dsh-vm-shell'; version = '1.2.0' } }
 
     'info' {
       $vm = Get-VmInstance $cfg.vm
       $s = $null
       try { $s = Get-PsSession } catch { }
       return @{
-        ok      = $true
-        vm      = $cfg.vm
-        state   = if ($vm) { $vm.EnabledState } else { $null }
-        guest   = $cfg.guestUser
-        session = if ($s) { $s.State.ToString() } else { 'none' }
+        ok        = $true
+        vm        = $cfg.vm
+        state     = if ($vm) { $vm.EnabledState } else { $null }
+        running   = [bool]($vm -and $vm.EnabledState -eq 2)
+        autoStart = -not ($cfg.autoStart -eq $false)
+        guest     = $cfg.guestUser
+        session   = if ($s) { $s.State.ToString() } else { 'none' }
       }
     }
 
@@ -216,8 +322,11 @@ function Invoke-Op($req) {
       if (-not $req.script) { throw "ps needs 'script'" }
       $b64 = [string]$req.script
       $timeout = if ($req.timeout) { [int]$req.timeout } else { 120 }
+      $bootWait = if ($req.bootWaitSec -ne $null) { [int]$req.bootWaitSec } else { 180 }
       try {
-        $r = Invoke-GuestScript $b64 $timeout
+        # A request after a host reboot may arrive before the VM is even on.
+        [void](Ensure-VmRunning $bootWait)
+        $r = Invoke-GuestScript $b64 $timeout $bootWait
       } catch {
         Reset-PsSession
         throw
@@ -234,6 +343,29 @@ function Invoke-Op($req) {
     }
 
     'ps-reset' { Reset-PsSession; return @{ ok = $true } }
+
+    'power' {
+      $action = if ($req.action) { [string]$req.action } else { 'state' }
+      $vm = Get-VmInstance $cfg.vm
+      if (-not $vm) { throw "VM '$($cfg.vm)' not found" }
+      switch ($action) {
+        'state' { return @{ ok = $true; state = $vm.EnabledState; running = ($vm.EnabledState -eq 2) } }
+        'start' {
+          $okStart = Ensure-VmRunning $(if ($req.bootWaitSec) { [int]$req.bootWaitSec } else { 180 })
+          $vm = Get-VmInstance $cfg.vm
+          return @{ ok = $true; started = $okStart; state = $vm.EnabledState; running = ($vm.EnabledState -eq 2) }
+        }
+        'stop' {
+          [void](Invoke-MethodPositional $vm 'RequestStateChange' @([uint16]3))
+          return @{ ok = $true; state = 3; running = $false }
+        }
+        'reset' {
+          [void](Invoke-MethodPositional $vm 'RequestStateChange' @([uint16]10))
+          return @{ ok = $true }
+        }
+        default { return @{ ok = $false; error = "unknown power action '$action'" } }
+      }
+    }
 
     'key' {
       $kbd = Get-InputDevice 'Msvm_Keyboard' $cfg.vm
@@ -288,8 +420,8 @@ function Invoke-Op($req) {
       return @{ ok = ($r.ReturnValue -eq 0); rc = $r.ReturnValue }
     }
 
-    # Answer a UAC consent dialog. Alt+Y is the Yes accelerator (works on
-    # localized dialogs too, where the letter stays Y).
+    # Answer a UAC consent dialog. Alt+Y is the Yes accelerator (the letter stays
+    # Y on localized dialogs too).
     'uac-yes' {
       $kbd = Get-InputDevice 'Msvm_Keyboard' $cfg.vm
       [void](Invoke-MethodPositional $kbd 'PressKey' @([uint32]18))
@@ -315,10 +447,11 @@ function Invoke-Op($req) {
 }
 
 # ----------------------------------------------------------------- serve
+$HmacKey = Get-HmacKey $SecretPath
 $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, [int]$cfg.port)
 $listener.Start()
-Log "agent listening on 127.0.0.1:$($cfg.port) for VM '$($cfg.vm)'"
-if ($Verbose) { Write-Host "listening on 127.0.0.1:$($cfg.port)" }
+Log "agent listening on 127.0.0.1:$($cfg.port) for VM '$($cfg.vm)' (HMAC auth, skew ${MaxSkewSeconds}s)"
+if ($Trace) { Write-Host "listening on 127.0.0.1:$($cfg.port)" }
 
 while ($true) {
   try { $client = $listener.AcceptTcpClient() }
@@ -336,12 +469,13 @@ while ($true) {
       $line = $line.Trim()
       if (-not $line) { continue }
       try {
-        $req = $line | ConvertFrom-Json
+        # Authentication happens before any op runs: an unsigned or forged
+        # request never reaches Hyper-V or the guest.
+        $req = Test-Envelope $line $HmacKey
         if (-not $req.op) { throw "missing op" }
-        if ($req.op -ne 'ping' -and [string]$req.t -ne [string]$cfg.token) { throw "bad token" }
         $resp = Invoke-Op $req
       } catch {
-        $resp = @{ ok = $false; error = $_.Exception.Message }
+        $resp = @{ ok = $false; error = $_.Exception.Message; auth = $false }
       }
       try { $writer.WriteLine(($resp | ConvertTo-Json -Compress -Depth 6)) }
       catch { break }
