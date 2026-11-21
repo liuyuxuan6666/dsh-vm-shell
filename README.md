@@ -251,6 +251,53 @@ powershell -ExecutionPolicy Bypass -File .\test\Test-Agent.ps1 -Body '{"op":"inf
 
 ---
 
+## 开发注意（踩过的坑）
+
+**PowerShell 函数名不要和内置 cmdlet 只差大小写或连字符位置。** 命令解析不区分大小写，`New-PsSession` 与 `New-PSSession` 是同一个名字：自定义函数会**覆盖** cmdlet，函数内部再调 `New-PSSession` 就是调自己，报错为
+
+```
+由于调用深度溢出，脚本失败。
+```
+
+（本项目的 `New-GuestSession` / `Get-GuestSession` / `Reset-GuestSession` 就是为此改的名。）
+
+其他几条：
+
+- agent 是**单线程**的：一条请求处理完就关连接，一次只服务一个客户端。
+- 任何可能长时间阻塞的调用（建会话、开 VM）都必须带超时，否则会把整个循环卡住。
+- `info` 这类状态查询**不能创建会话**，否则 guest 正在启动时它会阻塞几十秒。
+
+---
+
+## guest 重装系统之后
+
+重装/还原会让 guest 里的 `dsh` 账号消失，`config.json` 里的凭据随之失效。按下面顺序恢复：
+
+1. 等 guest 装完、进到桌面（**VMConnect 用基本会话**）。
+2. 重新建账号——用注入路径（此时还没有 PowerShell Direct）：
+
+   ```
+   vm_key   vk=91            # Win
+   vm_type  "cmd"            # 或直接点开始菜单
+   vm_key   vk=13            # Enter
+   vm_type  "net user dsh DshVm2026Alpha /add"
+   vm_key   vk=13
+   vm_type  "net localgroup administrators dsh /add"
+   vm_key   vk=13
+   ```
+
+   需要提权时先 `Win+X` → `A` → `vm_uac_yes`。
+
+3. 删掉可能的旧会话缓存再试 `vm_ps`：
+
+   ```
+   vm_ps        # 会自动重试建会话
+   ```
+
+4. 如果换过密码，重跑一次 `Install-VmAgent.ps1` 更新 `config.json`（顺便轮换签名密钥）。
+
+---
+
 ## 杀软误报
 
 这个 agent 天生"长得像后门"：隐藏窗口、SYSTEM 计划任务、本地套接字、在远端执行 PowerShell。启发式引擎命中它很正常，不代表真的有问题，但你必须**主动加白**，否则：

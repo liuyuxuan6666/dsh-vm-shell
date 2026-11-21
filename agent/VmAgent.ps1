@@ -213,33 +213,39 @@ function Get-ScreenPng([int]$w, [int]$h, [string]$fmt) {
 # ----------------------------------------------------------------- PowerShell Direct
 $script:Session = $null
 
-function New-PsSession {
+function New-GuestSession {
   if (-not $cfg.guestUser -or -not $cfg.guestPassword) {
     throw "no guestUser/guestPassword in config; write them or run Install-VmAgent.ps1"
   }
   $sec = ConvertTo-SecureString $cfg.guestPassword -AsPlainText -Force
   $cred = New-Object System.Management.Automation.PSCredential($cfg.guestUser, $sec)
+  # Without explicit timeouts a dead guest makes New-PSSession hang for minutes,
+  # and the whole single-threaded request loop with it.
+  $opts = New-PSSessionOption -OpenTimeout 15000 -OperationTimeout 60000 -CancelTimeout 5000
   Log "opening PowerShell Direct session to $($cfg.vm) as $($cfg.guestUser)"
-  $script:Session = New-PSSession -VMName $cfg.vm -Credential $cred -ErrorAction Stop
+  $script:Session = New-PSSession -VMName $cfg.vm -Credential $cred -SessionOption $opts -ErrorAction Stop
   return $script:Session
 }
 
-# Open (or reuse) the session. With waitSec > 0 it keeps retrying: right after a
-# boot the guest is Running long before PowerShell Direct answers.
-function Get-PsSession([int]$waitSec = 0) {
+# Open (or reuse) the session. waitSec > 0 keeps retrying while the guest boots;
+# waitSec = 0 makes exactly one attempt so a status call can never block.
+function Get-GuestSession([int]$waitSec = 0) {
   $deadline = (Get-Date).AddSeconds([Math]::Max($waitSec, 0))
+  $attempt = 0
   while ($true) {
     if ($script:Session -and $script:Session.State -eq 'Opened') { return $script:Session }
     try {
-      return (New-PsSession)
+      return (New-GuestSession)
     } catch {
-      if ((Get-Date) -ge $deadline) { throw }
+      $attempt++
+      Log "session attempt $attempt failed: $($_.Exception.Message)"
+      if ($waitSec -le 0 -or (Get-Date) -ge $deadline) { throw }
       Start-Sleep -Seconds 3
     }
   }
 }
 
-function Reset-PsSession {
+function Reset-GuestSession {
   if ($script:Session) { try { Remove-PSSession $script:Session -ErrorAction SilentlyContinue } catch { } }
   $script:Session = $null
 }
@@ -266,7 +272,7 @@ function Ensure-VmRunning([int]$waitSec = 0) {
 # Run one PowerShell script inside the guest, elevated, and return its text output.
 function Invoke-GuestScript([string]$base64, [int]$timeoutSec, [int]$bootWaitSec = 0) {
   if ($timeoutSec -le 0) { $timeoutSec = 120 }
-  $s = Get-PsSession -waitSec $bootWaitSec
+  $s = Get-GuestSession -waitSec $bootWaitSec
   $sb = {
     param($b64)
     $ErrorActionPreference = 'Continue'
@@ -305,8 +311,9 @@ function Invoke-Op($req) {
 
     'info' {
       $vm = Get-VmInstance $cfg.vm
-      $s = $null
-      try { $s = Get-PsSession } catch { }
+      # Report the cached session only: a status call must never open one, or a
+      # guest that is booting would block every later request.
+      $sessionState = if ($script:Session -and $script:Session.State -eq 'Opened') { 'Opened' } else { 'none' }
       return @{
         ok        = $true
         vm        = $cfg.vm
@@ -314,7 +321,7 @@ function Invoke-Op($req) {
         running   = [bool]($vm -and $vm.EnabledState -eq 2)
         autoStart = -not ($cfg.autoStart -eq $false)
         guest     = $cfg.guestUser
-        session   = if ($s) { $s.State.ToString() } else { 'none' }
+        session   = $sessionState
       }
     }
 
@@ -328,7 +335,7 @@ function Invoke-Op($req) {
         [void](Ensure-VmRunning $bootWait)
         $r = Invoke-GuestScript $b64 $timeout $bootWait
       } catch {
-        Reset-PsSession
+        Reset-GuestSession
         throw
       }
       return @{
@@ -342,7 +349,7 @@ function Invoke-Op($req) {
       }
     }
 
-    'ps-reset' { Reset-PsSession; return @{ ok = $true } }
+    'ps-reset' { Reset-GuestSession; return @{ ok = $true } }
 
     'power' {
       $action = if ($req.action) { [string]$req.action } else { 'state' }
@@ -448,6 +455,15 @@ function Invoke-Op($req) {
 
 # ----------------------------------------------------------------- serve
 $HmacKey = Get-HmacKey $SecretPath
+try {
+  $hash = (Get-FileHash -Path $PSCommandPath -Algorithm SHA256).Hash.Substring(0, 12)
+} catch { $hash = 'unknown' }
+$who = [Security.Principal.WindowsIdentity]::GetCurrent()
+$isAdmin = (New-Object Security.Principal.WindowsPrincipal($who)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$banner = "agent v1.2.1 pid=$PID user=$($who.Name) admin=$isAdmin file=$PSCommandPath sha256=$hash"
+Log $banner
+if ($Trace) { Write-Host $banner }
+
 $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, [int]$cfg.port)
 $listener.Start()
 Log "agent listening on 127.0.0.1:$($cfg.port) for VM '$($cfg.vm)' (HMAC auth, skew ${MaxSkewSeconds}s)"
@@ -459,6 +475,10 @@ while ($true) {
 
   try {
     $stream = $client.GetStream()
+    # One request per connection keeps a client that dies mid-call from wedging
+    # the single-threaded loop for minutes.
+    $stream.ReadTimeout = 30000
+    $stream.WriteTimeout = 60000
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     $reader = New-Object System.IO.StreamReader($stream, $utf8NoBom)
     $writer = New-Object System.IO.StreamWriter($stream, $utf8NoBom)
@@ -479,6 +499,8 @@ while ($true) {
       }
       try { $writer.WriteLine(($resp | ConvertTo-Json -Compress -Depth 6)) }
       catch { break }
+      # One request per connection: close after answering.
+      break
     }
   } catch {
     Log "connection error: $($_.Exception.Message)"
